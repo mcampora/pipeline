@@ -1,0 +1,180 @@
+AWSTemplateFormatVersion: 2010-09-09
+
+Description: Reference architecture for a data pipeline using Glue, Athena
+
+Resources:
+  # The S3 bucket where the code will be uploaded.
+  ScriptsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: ref-pipeline-scripts-bucket-lazgar
+
+  # The S3 bucket where the data will be stored.
+  # Can use encryption, versioning and lifecycle policies
+  # to keep the data secure and cost-effective.
+  # Can also use multiple buckets, one for raw data and one for processed data,
+  # one for sensitive data and one for public data, etc.
+  DataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: ref-pipeline-data-bucket-lazgar
+
+  # The role associated with each job.
+  # Can be customized to restrict access to specific resources.
+  GlueJobRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - glue.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSGlueServiceRole"
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonAthenaFullAccess"
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonS3FullAccess"
+      Path: "/"
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                Resource:
+                  - "*"
+
+  # Metadata about the pipeline. 
+  PipelineGlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      DatabaseInput:
+        Name: ref-pipeline-database
+      CatalogId: !Ref AWS::AccountId
+
+  # A crawler to automatically discover the schema of the raw data.
+  RawCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Role: !Ref GlueJobRole
+      Name: ref-pipeline-rawcrawler
+      DatabaseName: !Ref PipelineGlueDatabase
+      Targets:
+        S3Targets:
+          - Path: !Sub "s3://${DataBucket}/raw/"
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+
+  # A first job cleaning raw data (removing duplicates, rows with missing values, save as parquet files, etc.).
+  CleanRawDataJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Role: !Ref GlueJobRole
+      Name: !Sub ref-pipeline-cleanrawdata
+      Command:
+        "Name": glueetl
+        "ScriptLocation": !Sub "s3://${ScriptsBucket}/scripts/clean-raw-data.py"
+      DefaultArguments:
+        "--database": !Ref PipelineGlueDatabase
+        "--input": "raw"
+        "--dataPath": !Ref DataBucket
+        "--output": "clean"
+        "--enable-job-insights": true
+        "--job-bookmark-option": "job-bookmark-enable"
+        "--enable-spark-ui": "true"
+        "--spark-event-logs-path": !Sub "s3://${DataBucket}/logs/"
+        "--enable-auto-scaling": True
+        "--TempDir": !Sub "s3://${DataBucket}/tmp/"
+      GlueVersion: "4.0"
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      MaxRetries: 0
+      Description: "Clean raw data"
+      WorkerType: "G.1X"
+      NumberOfWorkers: 2
+      Timeout: 60 # 1h
+
+  # A second job transforming data into a format suitable for analysis (grouping, aggregating, etc.)
+  PrepareDataJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Role: !Ref GlueJobRole
+      Name: !Sub ref-pipeline-preparedata
+      Command:
+        "Name": glueetl
+        "ScriptLocation": !Sub "s3://${ScriptsBucket}/scripts/prepare-data.py"
+      DefaultArguments:
+        "--database": !Ref PipelineGlueDatabase
+        "--input": "clean"
+        "--output": !Sub "s3://${DataBucket}/ready/"
+        "--enable-job-insights": true
+        "--job-bookmark-option": "job-bookmark-enable"
+        "--enable-spark-ui": "true"
+        "--spark-event-logs-path": !Sub "s3://${DataBucket}/logs/"
+        "--enable-auto-scaling": True
+        "--TempDir": !Sub "s3://${DataBucket}/tmp/"
+      GlueVersion: "4.0"
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      MaxRetries: 0
+      Description: "Prepare data"
+      WorkerType: "G.1X"
+      NumberOfWorkers: 2
+      Timeout: 60 # 1h
+
+  # A workflow chaining the crawler and the two jobs 
+  PipelineWorkflow:
+    Type: AWS::Glue::Workflow
+    Properties:
+      Name: ref-pipeline-workflow
+
+  # A trigger to run the workflow
+  # at the moment on demand, but can be scheduled to run once a day, once a week, etc.
+  RawCrawlerTrigger:
+    Type: AWS::Glue::Trigger
+    Properties:
+      Type: ON_DEMAND
+      Name: ref-pipeline-trigger
+      Actions:
+        - CrawlerName: !Ref RawCrawler
+      WorkflowName: !Ref PipelineWorkflow
+
+  # A trigger to run raw data processing job
+  CleanRawDataTrigger:
+    Type: AWS::Glue::Trigger
+    Properties:
+      Name: ref-pipeline-cleanrawdata-trigger
+      Type: CONDITIONAL
+      StartOnCreation: True
+      Actions:
+        - JobName: !Ref CleanRawDataJob
+      Predicate:
+        Logical: ANY
+        Conditions:
+          - LogicalOperator: EQUALS
+            CrawlerName: !Ref RawCrawler
+            CrawlState: SUCCEEDED
+      WorkflowName: !Ref PipelineWorkflow
+
+  # A trigger to run the prepare data job
+  PrepareDataTrigger:
+    Type: AWS::Glue::Trigger
+    Properties:
+      Name: ref-pipeline-preparedata-trigger
+      Type: CONDITIONAL
+      StartOnCreation: True
+      Actions:
+        - JobName: !Ref PrepareDataJob
+      Predicate:
+        Logical: ANY
+        Conditions:
+          - LogicalOperator: EQUALS
+            JobName: !Ref CleanRawDataJob
+            State: SUCCEEDED
+      WorkflowName: !Ref PipelineWorkflow
