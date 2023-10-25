@@ -1,5 +1,10 @@
+# Pipeline
+
 Simple demo on how to implement a data pipeline with Glue and Athena.  
 
+![The big picture](./pipeline.png)
+
+# Deployment
 Define AWS credentials in your terminal.  
 ```bash
 export AWS_ACCESS_KEY_ID="..."  
@@ -11,6 +16,10 @@ Deploy the AWS resources (the workflow, crawler, jobs) and pyspark scripts using
 ```bash
 ./deploy.sh
 ```
+
+![Glue console](./glue-console.png)
+
+# Launch
 Generate and push raw data.  
 Create a new csv file with a handfull of raws.  
 Push the new file to S3.  
@@ -22,4 +31,6 @@ Wait for the end of the pipeline, query the table using Athena to check the resu
 ```bash
 ./trigger.sh
 ```
+
+![Athena query](./athena.png)
 
